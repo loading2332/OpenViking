@@ -32,7 +32,7 @@ class _MetaVikingFS:
         persisted_meta: SessionMeta,
     ):
         self.meta_uri = f"{session_uri}/.meta.json"
-        self.files = {self.meta_uri: json.dumps(persisted_meta.to_dict())}
+        self.files = {self.meta_uri: json.dumps(persisted_meta.to_dict(include_internal=True))}
         self._async_agfs = _PathLock()
         self.writes = []
 
@@ -46,6 +46,10 @@ class _MetaVikingFS:
             raise FileNotFoundError(uri)
         return self.files[uri]
 
+    async def exists(self, uri, ctx=None):
+        del uri, ctx
+        return False
+
     async def write_file(self, uri, content, ctx=None, lease_ref=None):
         del ctx
         self.files[uri] = content
@@ -54,10 +58,12 @@ class _MetaVikingFS:
 
 @pytest.mark.asyncio
 async def test_commit_uses_event_tags_from_lock_protected_meta_snapshot(monkeypatch):
+    monkeypatch.setattr("openviking.session.session._enabled_memory_types", lambda: set())
     session_uri = "viking://user/default/sessions/session-1"
     persisted_meta = SessionMeta(
         session_id="session-1",
         event_search_tags=["channel=app"],
+        pending_usage_records=[{"uri": "viking://resources/context-1", "type": "context"}],
     )
     viking_fs = _MetaVikingFS(session_uri, persisted_meta)
     session = Session(
@@ -92,6 +98,7 @@ async def test_commit_uses_event_tags_from_lock_protected_meta_snapshot(monkeypa
         await session.commit_async()
 
     assert captured_queue_message["event_search_tags"] == ["channel=app"]
+    assert captured_queue_message["usage_uris"] == ["viking://resources/context-1"]
     assert viking_fs._async_agfs.acquired == 1
     assert viking_fs._async_agfs.released == 1
 
@@ -136,3 +143,35 @@ async def test_update_config_updates_policy_and_tags_in_one_locked_write():
     assert viking_fs.writes[0][2] is None
     assert viking_fs._async_agfs.acquired == 1
     assert viking_fs._async_agfs.released == 1
+
+
+@pytest.mark.asyncio
+async def test_used_accumulates_across_recreated_session_instances():
+    session_uri = "viking://user/default/sessions/session-1"
+    viking_fs = _MetaVikingFS(session_uri, SessionMeta(session_id="session-1"))
+
+    first_request = Session(
+        viking_fs=viking_fs,
+        session_id="session-1",
+        session_uri=session_uri,
+    )
+    await first_request.used_async(
+        contexts=["viking://resources/context-1"],
+        skill={"uri": "viking://skills/skill-1"},
+    )
+
+    second_request = Session(
+        viking_fs=viking_fs,
+        session_id="session-1",
+        session_uri=session_uri,
+    )
+    await second_request.used_async(
+        contexts=["viking://resources/context-2", "viking://resources/context-3"],
+        skill={"uri": "viking://skills/skill-2"},
+    )
+
+    assert second_request.stats.contexts_used == 3
+    assert second_request.stats.skills_used == 2
+    saved_meta = SessionMeta.from_dict(json.loads(viking_fs.files[viking_fs.meta_uri]))
+    assert len(saved_meta.pending_usage_records) == 5
+    assert "pending_usage_records" not in saved_meta.to_dict()
